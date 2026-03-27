@@ -1,5 +1,7 @@
 const fs = require('fs');
 const path = require('path');
+const { getPostgres } = require('../Functions/postgres.js');
+const { activeSessions } = require('../Events/connection.js');
 
 module.exports = () => ({
   name: "Delete Session Command",
@@ -36,13 +38,49 @@ module.exports = () => ({
         return m.reply(`❌ Session *${sessionNumber}* not found.`);
       }
 
+      if (activeSessions.has(sessionNumber)) {
+        try {
+          const sock = activeSessions.get(sessionNumber);
+          await sock.end({ logout: true });
+        } catch (e) {
+          console.error(`Error closing active session ${sessionNumber}:`, e);
+        } finally {
+          activeSessions.delete(sessionNumber);
+        }
+      }
+
       fs.rmdirSync(sessionPath, { recursive: true });
-      m.reply(`✅ Session *${sessionNumber}* deleted successfully.`);
+
+      
+      let pgDeleted = false;
+      try {
+        const { pgDb, SessionAuth, SessionDatabase } = getPostgres();
+        if (pgDb && SessionAuth && SessionDatabase) {
+          const transaction = await pgDb.transaction();
+          try {
+            await SessionAuth.destroy({ where: { session_id: sessionNumber }, transaction });
+            await SessionDatabase.destroy({ where: { session_id: sessionNumber }, transaction });
+            await transaction.commit();
+            pgDeleted = true;
+          } catch (pgErr) {
+            await transaction.rollback();
+            throw pgErr;
+          }
+        }
+      } catch (pgError) {
+        console.error(`PostgreSQL delete failed for ${sessionNumber}:`, pgError);
+      }
+
+      if (pgDeleted) {
+        await m.reply(`✅ Session *${sessionNumber}* deleted (local + PostgreSQL).`);
+      } else {
+        await m.reply(`✅ Session *${sessionNumber}* deleted locally.${process.env.DATABASE_URL ? ' PostgreSQL delete failed — check logs.' : ''}`);
+      }
       process.exit(42); 
 
     } catch (error) {
       console.error('Error deleting session:', error);
-      m.reply(`❌ Failed to delete session *${sessionNumber}*: ${error.message}`);
+      await m.reply(`❌ Failed to delete session *${sessionNumber}*: ${error.message}`);
     }
   }
 });
